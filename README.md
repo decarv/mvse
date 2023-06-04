@@ -1,6 +1,6 @@
 # mvse - A Multimodal Video Search Engine
 
-**_Under active development._**
+**_ARCHIVED._**
 
 This repository contains a multimodal semantic search engine for video datasets. It is multimodal because it
 uses not only written tags describing the video, but tries to obtain text descriptions from videos frames.
