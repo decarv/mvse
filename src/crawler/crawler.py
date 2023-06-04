@@ -1,104 +1,195 @@
+"""
+
+"""
 import os
 import re
-import logging
-import requests
 import json
-from urllib.parse import urljoin
-from urllib.request import urlretrieve
+import urllib
+import logging
+import datetime
+import sqlite3
+import requests
+import collections
+from queue import Queue
 from bs4 import BeautifulSoup
-from PyPDF2 import PdfMerger, PdfReader
-from pdfminer.high_level import extract_text
-
-from thesis import Thesis
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 class Crawler:
     """
-    This class structures all the theses into Theses objects from a search url.
+    A web crawler that fetches and stores webpages from a given base URL.
+
+    Attributes:
+        base_url (str): The base URL from which the crawler starts.
+        data_path (str): Path to the directory where data will be stored.
+        logs_path (str): Path to the directory where logs will be stored.
+        errors_path (str): Path to the directory where error logs will be stored.
+        database (str): Name of the SQLite database to use for storing webpages.
     """
 
     def __init__(self, **kwargs):
-        self.data_path = kwargs.get("data_path", ".")
-        self.base_urls = {}
-        self.theses = {}
-        self.errors = []
+        """
+        Initializes the crawler with necessary parameters and establishes a database connection.
+
+        Args:
+            **kwargs: Keyword arguments for configuration parameters.
+        """
+        logging.basicConfig(
+            level=logging.INFO,
+            filename=os.path.join(kwargs.get("logs_path"), "crawler.log"),
+            filemode="a",
+            format="%(asctime)s - %(levelname)s - %(message)s"
+        )
+        self.logger = logging.getLogger(__name__)
+
+        self.base_url: str = kwargs.get("base_url")
+        self.data_path: str = kwargs.get("data_path", ".")
+        self.logs_path: str = kwargs.get("logs_path", ".")
+        self.errors_path: str = kwargs.get("errors_path", ".")
+        self.database: str = kwargs.get("database", "webpages.db")
+
+        self.errors = collections.defaultdict(lambda: [])
         self.session = requests.Session()
+        self.session.headers.update({"Accept-Language": "pt-br,pt-BR"})
+
+        # Establish connection and create table webpages
+        self.conn = sqlite3.connect(self.database)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS webpages (
+                url TEXT PRIMARY KEY,
+                webpage BLOB,
+                metadata BOOLEAN NOT NULL DEFAULT 0,
+                document BOOLEAN NOT NULL DEFAULT 0,
+                parsed BOOLEAN NOT NULL DEFAULT 0
+            );
+        """)
+        self.conn.commit()
 
     def execute(self):
-        for base_url, v in self.base_urls.items():
-            urls = self.extract_webpages_urls(base_url)
-            for url in urls:
-                self.parse_thesis(url)
+        """
+        Executes the web crawling operation, starting from the base URL and traversing its children URLs.
+        """
+        self.logger.info("started execution")
 
-        self.store_theses()
+        queue = Queue()
 
-    def store_theses(self):
-        full_path = os.path.join(self.data_path, "theses.json")
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        dump_string = self.to_json()
-        with open(full_path, "w") as fp:
-            fp.write(dump_string)
-        logger.info(f"Theses stored in file: {full_path}")
-
-    def to_json(self):
-        return json.dumps({
-            k: v.__dict__
-            for k, v in self.theses.items()
-        })
-
-    def add_base_url(self, url):
-        if isinstance(url, list):
-            for item in url:
-                self.add_base_url(item)
+        visited = set()
+        # If database is empty, add base_url to queue, otherwise add all already visited urls
+        if self.cursor.execute("SELECT url FROM webpages LIMIT 1").fetchone() is None:
+            success = self.database_insert(self.base_url)
+            if not success:
+                return self.stop()
+            queue.put(self.base_url)
+            visited.add(self.base_url)
         else:
-            if url not in self.base_urls:
-                response = requests.get(url, headers={"Accept-Language": "pt-br,pt-BR"})
-                *_, self.base_urls[url] = self.extract_instances_count(
-                    BeautifulSoup(response.content, "html.parser")
-                )
-                logger.info(f"Added base URL: {url}")
+            res = self.cursor.execute("SELECT url FROM webpages")
+            visited_urls = [[_] for _ in res.fetchall()]
+            for url in visited_urls:
+                queue.put(url)
+                visited.add(url)
+
+        # Traverse the website as BFS
+        while not queue.empty():
+            current: str = queue.get()
+            [webpage] = self.database_select_instance(column="url", value=current)
+            soup = BeautifulSoup(webpage, "html.parser")
+
+            # Obtain children urls of current webpage
+            children = []
+            a_tags = soup.find_all("a")
+            for a_tag in a_tags:
+                url: str = a_tag.attrs.get("href")
+                if url is not None:
+                    url = urllib.parse.urljoin(self.base_url, url)
+                    children.append(url)
+
+            # Traverse children urls
+            for child in children:
+                parsed_url = urllib.parse.urlparse(child)
+
+                # Ignore the website in other languages
+                query: str = parsed_url.query
+                if "lang" in query and "lang=pt" not in query:
+                    self.logger.warning(f"found lang!=pt: {child}, continuing")
+                    continue
+
+                # Ignore links that are not urls
+                if parsed_url.scheme and (parsed_url.scheme != "http" or parsed_url.scheme != "https"):
+                    self.logger.warning(f"found link!=url: {child}, continuing")
+                    continue
+
+                url = urllib.parse.urljoin(self.base_url, child)
+                if url not in visited:
+                    success = self.database_insert(url)
+                    if success:
+                        queue.put(url)
+                        visited.add(url)
+
+        self.stop()
+
+    def stop(self) -> None:
+        """
+        Stops the web crawler, closes the database connection and logs the errors encountered during
+        execution.
+        """
+        self.conn.close()
+        with open(os.path.join(self.errors_path, "errors_crawler.json"), "w") as f:
+            f.write(json.dumps(self.errors))
+        self.logger.info(f"Stopping crawler. #Errors: {len(self.errors)}")
+
+    def database_insert(self, url: str) -> bool:
+        """
+        Fetches the webpage at the given URL and inserts it into the database.
+
+        Args:
+            url (str): The URL of the webpage to fetch and insert into the database.
+
+        Returns:
+            bool: True if the webpage was successfully inserted into the database, False otherwise.
+        """
+        response = self.session.get(url)
+        if not response.ok:
+            self.logger.error(f"unable to obtain {url}. Code: {response.status_code}")
+            self.errors["request"].append((url, response.status_code))
+            return False
+
+        webpage: bytes = response.content
+        metadata: bool = False
+        document: bool = False
+        if re.search("tde-\d+-\d+", url) is not None:
+            if re.search(".pdf$", url) is not None:
+                document = True
             else:
-                raise Exception("Base url already added.")
+                metadata = True
+        self.cursor.execute("""
+            INSERT INTO webpages VALUES(?, ?, ?, ?, ?)
+        """, (url, webpage, metadata, document, 0))
+        self.conn.commit()
 
-    def extract_webpages_urls(self, base_url):
-        theses_webpages_urls = []
-        for page in range(1, self.base_urls[base_url]):
-            url = f'{base_url}{page}'
-            list_webpage = requests.get(url, headers={"Accept-Language": "pt-br,pt-BR"})
-            if list_webpage is None or not list_webpage.ok:
-                self.errors.append(url)
-                logger.warning(f"Error retrieving webpage: {url}")
-                continue
+        self.logger.info(f"successfully inserted {url} to webpages")
 
-            soup = BeautifulSoup(list_webpage.content, 'html.parser')
-            elements = soup.select("div.dadosDocNome a")
-            urls = [el.get('href') for el in elements]
-            for _ in urls:
-                theses_webpages_urls.append(_)
+        return True
 
-            urls_in_page, *_ = self.extract_instances_count(soup)
-            logging.info(f"Number of extracted elements in page: {len(urls)}. Expected number of "
-                         f"extracted elements {urls_in_page}")
-            if len(urls) != urls_in_page:
-                logging.warning(f"Unexpected error while extracting webpage urls from {url}")
+    def database_contains(self, url: str) -> bool:
+        """
+        Checks if the database contains a webpage at the given URL.
+        Args:
+            url (str): The URL to check in the database.
+        Returns:
+            bool: True if the database contains a webpage at the given URL, False otherwise.
+        """
+        return self.database_select_instance(column="url", value=url) is None
 
-        return theses_webpages_urls
-
-    def extract_instances_count(self, soup):
-        page_info = soup.find(class_="dadosLinha").text
-        numbers = re.findall(r"\d+", page_info)
-        return list(map(int, numbers))
-
-    def parse_thesis(self, url):
-        webpage = requests.get(url, headers={"Accept-Language": "pt-br,pt-BR"})
-        if not webpage.ok:
-            logger.warning(f"Error retrieving webpage: {url}")
-            return None
-        thesis = Thesis()
-        thesis.parse_webpage(webpage.content)
-        [id] = re.findall("tde-\d+-\d+", url)
-        self.theses[id] = thesis
-        logger.info(f"Thesis parsed: {id}")
+    def database_select_instance(self, column: str, value: str) -> tuple:
+        """
+        Fetches a row from the database where the given column matches the given value.
+        Args:
+            column (str): The column to match.
+            value (str): The value to match in the column.
+        Returns:
+            tuple: The row from the database where the column matches the value, or None if no such
+            row exists.
+        """
+        query = f"SELECT * FROM webpages WHERE {column} = ?"
+        self.cursor.execute(query, (value, ))
+        return self.cursor.fetchone()
